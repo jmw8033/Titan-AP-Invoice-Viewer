@@ -1020,7 +1020,7 @@ class AutoCompleteEntry(tk.Entry):
 
     
     def search(self, company, invoice_prefix, account_filter, narrow):
-        if narrow and self.current_rows:
+        if narrow and self.root.current_rows:
             invoice_count = self.root.filter_rows(company, invoice_prefix, account_filter)
         else:
             invoice_count, values = self.root.show_invoices(company, invoice_prefix, account_filter)
@@ -1235,24 +1235,24 @@ class AutoCompleteEntry(tk.Entry):
         vendor = self.tree.set(row, "Vendor")
         invoice = self.tree.set(row, "Invoice")
 
-        gl_accounts = self.accounts_by_vendor_invoice[(vendor, invoice)]
+        gl_accounts = self.root.accounts_by_vendor_invoice[(vendor, invoice)]
         if len(gl_accounts) > 1:
             matching = [(acct, amt) for acct, amt in gl_accounts
-                        if acct is not None and self.account_match_filter(self.current_account_filter, acct)]
+                        if acct is not None and self.root.account_match_filter(self.root.current_account_filter, acct)]
             matching.sort(key=lambda x: x[0])
             if matching:
                 self.tree.set(row, "GL Account", "▼")
                 for acct, amt in matching:
                     amt = amt or 0
                     amt_s = f"${amt:,.2f}" if amt >= 0 else f"(${abs(amt):,.2f})"
-                    acct_s = f"{acct} - {self.account_description_by_account.get(acct, '')}"
+                    acct_s = f"{acct} - {self.root.account_description_by_account.get(acct, '')}"
                     self.tree.insert(row, "end", values=("", "", acct_s, amt_s, "", "", "", "", "", "", ""), tags="checkrow")
 
-        checks = list(self.checks_by_vendor_invoice[(vendor, invoice)])
+        checks = list(self.root.checks_by_vendor_invoice[(vendor, invoice)])
         if len(checks) > 1:
-            if self.date_filter_var.get() == "Check Date":
-                start_date = self.start_entry.get_date()
-                end_date = self.end_entry.get_date()
+            if self.root.date_filter_var.get() == "Check Date":
+                start_date = self.root.start_entry.get_date()
+                end_date = self.root.end_entry.get_date()
                 checks = [c for c in checks if start_date <= c[1].date() <= end_date]
             checks.sort(key=lambda x: x[1], reverse=True)
             if checks:
