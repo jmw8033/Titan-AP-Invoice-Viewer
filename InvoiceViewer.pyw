@@ -27,6 +27,12 @@ class InvoiceViewer(tk.Tk):
         self.company_ids = set() # Set of company IDs for quick lookup
         self.sort_col = "Date"
         self.sort_desc = True # descending
+        self.current_rows = []
+        self.result_count = 0
+        self.displayed_count = 0
+        self.page_size = 500
+        self._loading_page = False
+        self.current_account_filter = ""
         self.broken_companies = []
         self.broken_invoices = []
         self.by_vendor_invoice = []
@@ -488,7 +494,6 @@ class InvoiceViewer(tk.Tk):
         self.tree_frame = ttk.Frame(self, height=600)
         self.tree_frame.grid(row=1, column=0, sticky="nsew")
 
-        # Column setup
         self.tree = ttk.Treeview(self.tree_frame, columns=("Vendor", "Company Name", "GL Account", "Invoice", "Date", "Invoice Amount", "Balance", 
                                                            "Check Number", "Check Date", "File Available", "Filepath"), show='tree headings')
         self.tree.column("#0", width=0, stretch=False)
@@ -517,19 +522,83 @@ class InvoiceViewer(tk.Tk):
         self.tree.heading("Filepath", text="")
         self.tree.pack(side="left", fill="both", expand=True)
 
-        # Scrollbar
-        scrollbar = ttk.Scrollbar(self.tree_frame, command=self.tree.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree_scrollbar = ttk.Scrollbar(self.tree_frame, command=self.tree.yview)
+        self.tree_scrollbar.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=self._on_tree_scroll)
         self.tree.bind("<<TreeviewSelect>>", self.update_selected_sum)
 
-        # Styles
         self.style.configure("Treeview", rowheight=20) 
         self.tree.tag_configure("oddrow",  background="#f7f7f7")
         self.tree.tag_configure("evenrow", background="#ffffff")
         self.tree.tag_configure("checkrow", background="#fdfaf1")
-        
-    
+
+
+    def _on_tree_scroll(self, first, last):
+        self.tree_scrollbar.set(first, last)
+        if self._loading_page or self.displayed_count >= len(self.current_rows):
+            return
+        try:
+            near_bottom = float(last) >= 0.92
+        except (TypeError, ValueError):
+            return
+        if near_bottom:
+            self.after_idle(self.load_more_rows)
+
+
+    def _insert_result_row(self, row, index):
+        display = list(row)
+        vendor, invoice = row[0], row[3]
+
+        gl_accounts = self.accounts_by_vendor_invoice[(vendor, invoice)]
+        if len(gl_accounts) > 1:
+            matching = [(acct, amt) for acct, amt in gl_accounts
+                        if acct is not None and self.account_match_filter(self.current_account_filter, acct)]
+            if matching:
+                display[2] = "▼"
+
+        checks = self.checks_by_vendor_invoice[(vendor, invoice)]
+        if len(checks) > 1:
+            if self.date_filter_var.get() == "Check Date":
+                start_date = self.start_entry.get_date()
+                end_date = self.end_entry.get_date()
+                checks = [c for c in checks if start_date <= c[1].date() <= end_date]
+            if checks:
+                display[7] = "▼"
+
+        tag = "evenrow" if index % 2 == 0 else "oddrow"
+        self.tree.insert("", "end", values=display, tags=tag)
+
+
+    def load_more_rows(self, reset=False):
+        if self._loading_page:
+            return
+        self._loading_page = True
+        try:
+            if reset:
+                self.tree.delete(*self.tree.get_children())
+                self.displayed_count = 0
+
+            start = self.displayed_count
+            end = min(start + self.page_size, len(self.current_rows))
+            for i in range(start, end):
+                self._insert_result_row(self.current_rows[i], i)
+            self.displayed_count = end
+        finally:
+            self._loading_page = False
+        self.update_result_label()
+
+
+    def update_result_label(self):
+        total = self.result_count
+        if total == 0:
+            self.amount_label.config(text="No invoices found.")
+        elif total == 1:
+            self.amount_label.config(text="1 invoice found.")
+        elif self.displayed_count < total:
+            self.amount_label.config(text=f"{total:,} invoices found. Showing {self.displayed_count:,}.")
+        else:
+            self.amount_label.config(text=f"{total:,} invoices found.")
+
     def update_selected_sum(self, *_):
         total = 0
         for item in self.tree.selection():
@@ -546,153 +615,122 @@ class InvoiceViewer(tk.Tk):
         invoice_total = 0
         balance_total = 0
         values = []
+
         plant_filter = self.plant_var.get()
         date_filter = self.date_filter_var.get()
+        search = company.lower()
+        invoice_search = invoice_prefix.lower()
+        search_names = self.search_names.get()
+        all_companies = self.all_companies.get()
+        pdf_only = self.pdf_only.get()
+        ignoring = self.ignoring
+        ignore_list = self.ignore_list
+        start_date = self.start_entry.get_date()
+        end_date = self.end_entry.get_date()
 
         for entry in self.invoices:
-            # Check Plant ID, 110 for Concrete, 410 for Precast
             plant_id = entry["PlantID"]
             if plant_filter == "ACP" and plant_id != "110":
                 continue
             if plant_filter == "APC" and plant_id != "410":
                 continue
 
-            # Check company, invoice prefix, and account filter
             vendor = str(entry["VendorID"])
-            if self.ignoring and vendor in self.ignore_list:
+            if ignoring and vendor in ignore_list:
                 continue
-            search = company.lower()
-            name_match = self.search_names.get() and bool(search) and search in str(entry["CompanyName"]).lower()
-            if self.all_companies.get():
-                if search and not (vendor.lower().startswith(search) or name_match):
+            company_name = str(entry["CompanyName"])
+            vendor_l = vendor.lower()
+            name_match = search_names and bool(search) and search in company_name.lower()
+            if all_companies:
+                if search and not (vendor_l.startswith(search) or name_match):
+                    continue
+            elif not (vendor_l == search or name_match):
+                continue
+
+            invoice = str(entry["InvoiceNum"])
+            if account_filter:
+                accounts = self.accounts_by_vendor_invoice[(vendor, invoice)]
+                if not any(account and self.account_match_filter(account_filter, account) for account, _ in accounts):
+                    continue
+
+            date = entry["InvoiceDate"].date()
+            checks = self.checks_by_vendor_invoice[(vendor, invoice)]
+            if date_filter == "Invoice Date":
+                if date < start_date or date > end_date:
                     continue
             else:
-                if not (vendor.lower() == search or name_match):
-                    continue
-            if account_filter:
-                gl_accounts = self.accounts_by_vendor_invoice[(vendor, str(entry["InvoiceNum"]))].copy()
-                matched = False
-                for account, amount in gl_accounts:
-                    if account and self.account_match_filter(account_filter, account):
-                        matched = True
-                        break
-                if not matched:
+                if not any(start_date <= check_date.date() <= end_date for _, check_date, _ in checks):
                     continue
 
-            # Check if invoice date is between start and end dates
-            invoice =  str(entry["InvoiceNum"])
-            date = entry["InvoiceDate"].date()
-            if date_filter == "Invoice Date":
-                if date < self.start_entry.get_date() or date > self.end_entry.get_date():
-                    continue
-            elif date_filter == "Check Date":
-                checks = self.checks_by_vendor_invoice[(vendor, invoice)]
-                if not checks:
-                    continue
-                has_valid_check_date = False
-                for check_num, check_date, check_amount in checks:
-                    if check_date.date() >= self.start_entry.get_date() and check_date.date() <= self.end_entry.get_date():
-                        has_valid_check_date = True
-                        break
-                if not has_valid_check_date:
-                    continue 
-
-            # Check if Has File Only is checked
             filepath = entry.get("Filepath", "")
             has_filepath = "✔" if filepath else ""
-            if self.pdf_only.get() == 1 and not has_filepath:
+            if pdf_only and not filepath:
+                continue
+            if not invoice.lower().startswith(invoice_search):
                 continue
 
-            # If we passed all the filters, add the invoice to the list
-            if not invoice.lower().startswith(invoice_prefix.lower()):
-                continue
-            company_name = entry["CompanyName"]
-            amount = entry['Subtotal']
+            amount_value = entry['Subtotal']
             check_number = ""
-            check_date= ""
-
-            # Add subrows for checks
-            checks = self.checks_by_vendor_invoice[(vendor, invoice)]
+            check_date = ""
             if len(checks) == 1:
                 check_number, check_date, _ = checks[0]
                 check_date = check_date.strftime("%m-%d-%Y")
 
-            # Get Balance
             payments = entry["Payments"]
-            if payments == amount:
+            if payments == amount_value:
                 balance = "Paid In Full"
             else:
-                balance = amount - payments
-                balance_total += balance
-                balance = f"${balance:,.2f}" if balance >= 0 else f"(${abs(balance):,.2f})"
-            invoice_total += amount
-            amount = f"${amount:,.2f}" if amount >= 0 else f"(${abs(amount):,.2f})"
+                balance_value = amount_value - payments
+                balance_total += balance_value
+                balance = f"${balance_value:,.2f}" if balance_value >= 0 else f"(${abs(balance_value):,.2f})"
+            invoice_total += amount_value
+            amount = f"${amount_value:,.2f}" if amount_value >= 0 else f"(${abs(amount_value):,.2f})"
 
-            # get GL Account, just like checks
-            gl_account = self.accounts_by_vendor_invoice[(vendor, invoice)].copy()                    
-            if len(gl_account) == 1:
-                gl_account = gl_account[0]
-                gl_account = f"{gl_account[0]} - {self.account_description_by_account.get(gl_account[0], '')}"
+            gl_accounts = self.accounts_by_vendor_invoice[(vendor, invoice)]
+            if len(gl_accounts) == 1 and gl_accounts[0][0] is not None:
+                acct = gl_accounts[0][0]
+                gl_account = f"{acct} - {self.account_description_by_account.get(acct, '')}"
             else:
                 gl_account = ""
 
-            values.append((vendor, company_name, gl_account, invoice, date, amount, balance, check_number, check_date, has_filepath, filepath))
+            values.append((vendor, company_name, gl_account, invoice, date, amount, balance,
+                           check_number, check_date, has_filepath, filepath))
             invoice_count += 1
 
-        invoice_total =  f"${invoice_total:,.2f}" if invoice_total >= 0 else f"(${abs(invoice_total):,.2f})"
-        balance_total = f"${balance_total:,.2f}" if balance_total >= 0 else f"(${abs(balance_total):,.2f})"
-        self.invoice_total.set(f"Invoice Total: {invoice_total}")
-        self.balance_total.set(f"Balance Total: {balance_total}")
-
+        invoice_total_s = f"${invoice_total:,.2f}" if invoice_total >= 0 else f"(${abs(invoice_total):,.2f})"
+        balance_total_s = f"${balance_total:,.2f}" if balance_total >= 0 else f"(${abs(balance_total):,.2f})"
+        self.invoice_total.set(f"Invoice Total: {invoice_total_s}")
+        self.balance_total.set(f"Balance Total: {balance_total_s}")
         return invoice_count, values
 
+    def filter_rows(self, company, invoice_prefix, account_filter):
+        company_l = company.lower()
+        invoice_l = invoice_prefix.lower()
+        search_names = self.search_names.get()
 
-    def filter_rows(self, company, invoice_prefix, account_filter): # Filter current rows based on company name, invoice, and gl account
-        invoice_total = 0
-        balance_total = 0
-        i = 1
+        def keep(row):
+            company_ok = row[0].lower().startswith(company_l) or (search_names and company_l in row[1].lower())
+            if not company_ok or not row[3].lower().startswith(invoice_l):
+                return False
+            if account_filter:
+                accounts = self.accounts_by_vendor_invoice[(row[0], row[3])]
+                return any(acct and self.account_match_filter(account_filter, acct) for acct, _ in accounts)
+            return True
 
-        for row in self.tree.get_children():
-            values = self.tree.item(row, "values")
-            # Check company and invoice prefix
-            company_l = company.lower()
-            company_ok = values[0].lower().startswith(company_l) or (self.search_names.get() and company_l in values[1].lower())
-            if not company_ok or not values[3].lower().startswith(invoice_prefix.lower()):
-                self.tree.delete(row)
-            elif values[2] in ("▼", "▲"): # Has subrows, need to check each subrow for account filter
-                subrows = self.tree.get_children(row)
-                remove_row = True
-                for subrow in subrows:
-                    subvalues = self.tree.item(subrow, "values")
-                    if self.account_match_filter(account_filter, subvalues[2]):
-                        remove_row = False
-                    else:
-                        self.tree.delete(subrow)
-                if remove_row:
-                    self.tree.delete(row)
-            elif not self.account_match_filter(account_filter, values[2]): # No subrows, just check account filter
-                self.tree.delete(row)
+        self.current_rows = [row for row in self.current_rows if keep(row)]
+        self.current_account_filter = account_filter
+        self.result_count = len(self.current_rows)
 
-        # Recalculate totals and set row colors
-        for row in self.tree.get_children():
-            i += 1
-            # Set color tag
-            tag = "evenrow" if i % 2 == 0 else "oddrow"
-            self.tree.item(row, tags=tag)
-            # Format totals.;
-            invoice_total += float(values[5].replace("$", "").replace("(", "-").replace(",", "").replace(")", ""))
-            if values[6] != "Paid In Full":
-                balance_total += float(values[6].replace("$", "").replace("(", "-").replace(",", "").replace(")", ""))
-
-        invoice_total = f"${invoice_total:,.2f}" if invoice_total >= 0 else f"(${abs(invoice_total):,.2f})"
-        balance_total = f"${balance_total:,.2f}" if balance_total >= 0 else f"(${abs(balance_total):,.2f})"
-        self.invoice_total.set(f"Invoice Total: {invoice_total}")
-        self.balance_total.set(f"Balance Total: {balance_total}")
-
+        money = lambda s: float(s.replace("$", "").replace("(", "-").replace(",", "").replace(")", "")) if s and s != "Paid In Full" else 0.0
+        invoice_total = sum(money(row[5]) for row in self.current_rows)
+        balance_total = sum(money(row[6]) for row in self.current_rows)
+        invoice_total_s = f"${invoice_total:,.2f}" if invoice_total >= 0 else f"(${abs(invoice_total):,.2f})"
+        balance_total_s = f"${balance_total:,.2f}" if balance_total >= 0 else f"(${abs(balance_total):,.2f})"
+        self.invoice_total.set(f"Invoice Total: {invoice_total_s}")
+        self.balance_total.set(f"Balance Total: {balance_total_s}")
         self.update_account_sum()
-        
-        return len(self.tree.get_children())
-    
+        self.load_more_rows(reset=True)
+        return self.result_count
 
     def clear_filters(self):
         self.company_entry.delete(0, "end")
@@ -709,122 +747,72 @@ class InvoiceViewer(tk.Tk):
 
     def update_account_sum(self):
         total = 0
-        for row in self.tree.get_children():
-            subrows = self.tree.get_children(row)
-            children = [c for c in subrows if self.tree.set(c, "GL Account")]
-            if children:
-                for c in children:
-                    subvals = self.tree.item(c, "values")
-                    amt = subvals[3] # GL Account Amount
-                    total += float(amt.replace("$", "").replace("(", "-").replace(",", "").replace(")", ""))
-            else:
-                # Get main row amount from Invoice Amount
-                vals = self.tree.item(row, "values")
-                amt = vals[5]
+        account_filter = self.current_account_filter
+        for row in self.current_rows:
+            accounts = self.accounts_by_vendor_invoice[(row[0], row[3])]
+            valid = [(acct, amt) for acct, amt in accounts
+                     if acct is not None and (not account_filter or self.account_match_filter(account_filter, acct))]
+            if valid:
+                total += sum((amt or 0) for _, amt in valid)
+            elif not accounts:
+                amt = row[5]
                 total += float(amt.replace("$", "").replace("(", "-").replace(",", "").replace(")", ""))
-        total = f"${total:,.2f}" if total >= 0 else f"(${abs(total):,.2f})"
-        self.account_sum.set(f"Account Total: {total}")
-
+        total_s = f"${total:,.2f}" if total >= 0 else f"(${abs(total):,.2f})"
+        self.account_sum.set(f"Account Total: {total_s}")
 
     def sort_by(self, col, values=None, header_pressed=True, watch_cursor=True):
-        account_filter = self.account_text.get()
         if header_pressed:
             if col == self.sort_col:
                 self.sort_desc = not self.sort_desc
             else:
                 self.sort_col = col
-                self.sort_desc = True   
+                self.sort_desc = True
 
-        if not values:
-            values = [self.tree.item(i, "values") for i in self.tree.get_children()]
+        if values is not None:
+            self.current_rows = list(values)
+            self.result_count = len(self.current_rows)
+            self.current_account_filter = self.account_text.get()
 
         def invoice_key(inv):
             if inv.isdigit():
                 return [(0, int(inv))]
-            key = []
             return [(1,)] + [(0, int(p)) if p.isdigit() else (1, p.lower()) for p in invoice_re.split(inv) if p]
 
+        money = lambda s: float(s.replace("$", "").replace("(", "-").replace(",", "").replace(")", "")) if s and s != "Paid In Full" else 0
         keymap = {
             "Vendor": lambda x: x[0],
             "Company Name": lambda x: x[1],
             "GL Account": lambda x: x[2],
             "Invoice": lambda x: invoice_key(str(x[3])),
             "Date": lambda x: x[4],
-            "Invoice Amount": lambda x: float(x[5].replace("$", "").replace("(", "-").replace(",", "").replace(")", "")),
-            "Balance": lambda x: float(x[6].replace("$", "").replace("(", "-").replace(",", "").replace(")", "")) if x[6] != "Paid In Full" else 0,
+            "Invoice Amount": lambda x: money(x[5]),
+            "Balance": lambda x: money(x[6]),
             "Check Number": lambda x: x[7],
-            "Check Date": lambda x: datetime.strptime(x[8], "%m-%d-%Y")  if x[8] else datetime(2000, 1, 1),
+            "Check Date": lambda x: datetime.strptime(x[8], "%m-%d-%Y") if x[8] else datetime(2000, 1, 1),
             "File Available": lambda x: x[9]
         }
         reverse = self.sort_desc
-        if col == "Vendor" or col == "Invoice" or col == "Company Name":
+        if col in ("Vendor", "Invoice", "Company Name"):
             reverse = not reverse
 
         if watch_cursor:
             self.config(cursor="watch")
             self.tree.config(cursor="watch")
-            self.after(25, lambda: self.sort(col, values, keymap, reverse, account_filter))
+            self.after(25, lambda: self.sort(col, keymap, reverse))
         else:
-            self.sort(col, values, keymap, reverse, account_filter)
+            self.sort(col, keymap, reverse)
 
 
-    def sort(self, col, values, keymap, reverse, account_filter):
-        self.tree.delete(*self.tree.get_children())
-        values.sort(key=keymap[col], reverse=reverse)
-        for i, row in enumerate(values):
-            tag = "evenrow" if i % 2 == 0 else "oddrow"
-            iid = self.tree.insert("", "end", values=row, tags=tag)
-
-            # Add subrows GL Accounts
-            gl_accounts = self.accounts_by_vendor_invoice[(row[0], row[3])].copy()
-            if len(gl_accounts) > 1:
-                gl_accounts_copy = gl_accounts.copy()
-                for account, amount in gl_accounts_copy:
-                    if account is None:
-                        gl_accounts.remove((account, amount))
-                    if not self.account_match_filter(account_filter, account):
-                        gl_accounts.remove((account, amount))
-                    
-                if len(gl_accounts) == 0:
-                    self.tree.delete(iid)
-                    continue
-                else:
-                    # Sort GL accounts by account number
-                    gl_accounts.sort(key=lambda x: x[0])
-                    self.tree.set(iid, "GL Account", "▼")
-                    for i in range(len(gl_accounts)):
-                        acct, amt = gl_accounts[i]
-                        if amt is None:
-                            amt = 0
-                        else:
-                            amt = f"${amt:,.2f}" if amt >= 0 else f"(${abs(amt):,.2f})"
-                        acct = f"{acct} - {self.account_description_by_account.get(acct, '')}"
-                        self.tree.insert(iid, "end", values=("", "", acct, amt, "", "", "", "", "", "", ""), tags="checkrow")
-
-            # Add subrows Checks
-            checks = self.checks_by_vendor_invoice[(row[0], row[3])]
-            if len(checks) > 1:
-                # Sort checks by check date, newest first
-                checks.sort(key=lambda x: x[1], reverse=True)
-                for cnum, cdate, camt in checks:
-                    if self.date_filter_var.get() == "Check Date":
-                        if cdate.date() < self.start_entry.get_date() or cdate.date() > self.end_entry.get_date():
-                            continue
-                    self.tree.set(iid, "Check Number", "▼")
-                    cdate = cdate.strftime("%m-%d-%Y")
-                    camt = f"${camt:,.2f}" if camt >= 0 else f"(${abs(camt):,.2f})"
-                    self.tree.insert(iid, "end", values=("", "", "", "", "", "", camt, cnum, cdate, "", ""), tags="checkrow")
-
+    def sort(self, col, keymap, reverse):
+        self.current_rows.sort(key=keymap[col], reverse=reverse)
+        self.load_more_rows(reset=True)
         arrow = "  ▼" if self.sort_desc else "  ▲"
         for c in self.tree["columns"]:
-            text = c + arrow if c == col else c
-            self.tree.heading(c, text=text)
-        
+            self.tree.heading(c, text=c + arrow if c == col else c)
         self.update_account_sum()
         self.config(cursor="")
         self.tree.config(cursor="")
         return "break"
-
 
     def account_match_filter(self, account_filter, account):
         filter = account_filter.lower()
@@ -887,6 +875,12 @@ class InvoiceViewer(tk.Tk):
 
         self.columnconfigure(0, weight=0)
         self.rowconfigure(0, weight=0)
+
+        self.current_rows.clear()
+        self.result_count = 0
+        self.displayed_count = 0
+        self._loading_page = False
+        self.current_account_filter = ""
 
         gc.collect()
 
@@ -1026,28 +1020,19 @@ class AutoCompleteEntry(tk.Entry):
 
     
     def search(self, company, invoice_prefix, account_filter, narrow):
-        if narrow:
-            # Filter current rows
+        if narrow and self.current_rows:
             invoice_count = self.root.filter_rows(company, invoice_prefix, account_filter)
         else:
-            self.tree.delete(*self.tree.get_children())
-            # Update treeview with invoices for selected company
             invoice_count, values = self.root.show_invoices(company, invoice_prefix, account_filter)
-            # Resort
+            self.root.current_account_filter = account_filter
             self.root.sort_by(self.root.sort_col, values, header_pressed=False, watch_cursor=False)
-        
+
+        self.root.result_count = invoice_count
+        self.root.update_result_label()
         self.root.config(cursor="")
         self.config(cursor="")
         self.root.tree.config(cursor="")
-
-        if invoice_count == 0:
-            self.root.amount_label.config(text="No invoices found.")
-        elif invoice_count == 1:
-            self.root.amount_label.config(text="1 invoice found.")
-        else:
-            self.root.amount_label.config(text=f"{invoice_count} invoices found.")
         self.close_listbox()
-
 
     def listbox_move(self, dir):
         if not self.listbox:
@@ -1243,47 +1228,63 @@ class AutoCompleteEntry(tk.Entry):
         self.copy_to_clipboard("\n".join(self.row_text(row) for row in rows))
 
 
-    def toggle_checks(self, row):
-        subrows = self.tree.get_children(row)
-        has_check = False
-        for subrow in subrows:
-            if self.tree.set(subrow, "Check Number"):
-                has_check = True
-                break
+    def _ensure_invoice_children(self, row):
+        if self.tree.get_children(row):
+            return
 
-        if has_check:
-            is_open = self.tree.item(row, "open")
-            if is_open:
+        vendor = self.tree.set(row, "Vendor")
+        invoice = self.tree.set(row, "Invoice")
+
+        gl_accounts = self.accounts_by_vendor_invoice[(vendor, invoice)]
+        if len(gl_accounts) > 1:
+            matching = [(acct, amt) for acct, amt in gl_accounts
+                        if acct is not None and self.account_match_filter(self.current_account_filter, acct)]
+            matching.sort(key=lambda x: x[0])
+            if matching:
+                self.tree.set(row, "GL Account", "▼")
+                for acct, amt in matching:
+                    amt = amt or 0
+                    amt_s = f"${amt:,.2f}" if amt >= 0 else f"(${abs(amt):,.2f})"
+                    acct_s = f"{acct} - {self.account_description_by_account.get(acct, '')}"
+                    self.tree.insert(row, "end", values=("", "", acct_s, amt_s, "", "", "", "", "", "", ""), tags="checkrow")
+
+        checks = list(self.checks_by_vendor_invoice[(vendor, invoice)])
+        if len(checks) > 1:
+            if self.date_filter_var.get() == "Check Date":
+                start_date = self.start_entry.get_date()
+                end_date = self.end_entry.get_date()
+                checks = [c for c in checks if start_date <= c[1].date() <= end_date]
+            checks.sort(key=lambda x: x[1], reverse=True)
+            if checks:
                 self.tree.set(row, "Check Number", "▼")
-                if self.tree.set(row, "GL Account") in ("▲", "▼"):
-                    self.tree.set(row, "GL Account", "▼")
-            else:
-                self.tree.set(row, "Check Number", "▲")
-                if self.tree.set(row, "GL Account") in ("▲", "▼"):
-                    self.tree.set(row, "GL Account", "▲")
-            self.tree.item(row, open=not is_open)
+                for cnum, cdate, camt in checks:
+                    cdate_s = cdate.strftime("%m-%d-%Y")
+                    camt = camt or 0
+                    camt_s = f"${camt:,.2f}" if camt >= 0 else f"(${abs(camt):,.2f})"
+                    self.tree.insert(row, "end", values=("", "", "", "", "", "", camt_s, cnum, cdate_s, "", ""), tags="checkrow")
 
+
+    def toggle_checks(self, row):
+        if self.tree.set(row, "Check Number") not in ("▼", "▲"):
+            return
+        self._ensure_invoice_children(row)
+        is_open = self.tree.item(row, "open")
+        new_open = not is_open
+        self.tree.set(row, "Check Number", "▲" if new_open else "▼")
+        if self.tree.set(row, "GL Account") in ("▲", "▼"):
+            self.tree.set(row, "GL Account", "▲" if new_open else "▼")
+        self.tree.item(row, open=new_open)
 
     def toggle_gl_accounts(self, row):
-        subrows = self.tree.get_children(row)
-        has_gl_account = False
-        for subrow in subrows:
-            if self.tree.set(subrow, "GL Account"):
-                has_gl_account = True
-                break
-
-        if has_gl_account:
-            is_open = self.tree.item(row, "open")
-            if is_open:
-                self.tree.set(row, "GL Account", "▼")
-                if self.tree.set(row, "Check Number") in ("▲", "▼"):
-                    self.tree.set(row, "Check Number", "▼")
-            else:
-                self.tree.set(row, "GL Account", "▲")
-                if self.tree.set(row, "Check Number") in ("▲", "▼"):
-                    self.tree.set(row, "Check Number", "▲")
-            self.tree.item(row, open=not is_open)
-    
+        if self.tree.set(row, "GL Account") not in ("▼", "▲"):
+            return
+        self._ensure_invoice_children(row)
+        is_open = self.tree.item(row, "open")
+        new_open = not is_open
+        self.tree.set(row, "GL Account", "▲" if new_open else "▼")
+        if self.tree.set(row, "Check Number") in ("▲", "▼"):
+            self.tree.set(row, "Check Number", "▲" if new_open else "▼")
+        self.tree.item(row, open=new_open)
 
     def toggle_all_companies(self):
         if self.root.all_companies.get():
