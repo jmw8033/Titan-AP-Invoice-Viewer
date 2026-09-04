@@ -399,7 +399,7 @@ class InvoiceViewer(tk.Tk):
 
         # All companies checkbox
         self.all_companies = tk.BooleanVar()
-        self.all_companies_cb = ttk.Checkbutton(self.filter_frame, text="Search All Companies", variable=self.all_companies, command=self.company_entry.toggle_all_companies, takefocus=False)
+        self.all_companies_cb = ttk.Checkbutton(self.filter_frame, text="View All Companies", variable=self.all_companies, command=self.company_entry.toggle_all_companies, takefocus=False)
         self.all_companies_cb.grid(row=0, column=8, padx=5)
 
         # Search names checkbox - when on, the company box also matches vendor names, not just IDs
@@ -1446,7 +1446,7 @@ class HelpPopup(tk.Toplevel):
         b("Company ID  — Type a vendor ID into the Company ID box. A suggestion list will")
         b("appear; click a result or press Enter to load that vendor's invoices")
         b("")
-        b("Search All Companies  — Check this box to show invoices across all vendors at once")
+        b("View All Companies  — Check this box to show invoices across all vendors at once")
         b("In this mode the Company ID box becomes a prefix filter: typing 'AC' shows every")
         b("vendor whose ID starts with 'AC', rather than requiring an exact match")
         b("")
