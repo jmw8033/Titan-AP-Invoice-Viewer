@@ -236,12 +236,21 @@ class InvoiceViewer(tk.Tk):
             )
 
             with conn.cursor(as_dict=True) as cur:
+                # Load invoice rows for the results table.
                 cur.execute("""
                     SELECT APH.VendorID, APH.InvoiceNum, APH.InvoiceDate, APH.Subtotal, APH.Payments, APH.PlantID, APH.RecordNum, V.CompanyName
                     FROM AP_Header APH
                     JOIN Vendors V ON APH.VendorID = V.VendorId
                 """)
                 data = cur.fetchall()
+
+                # Load the autocomplete/vendor list independently from AP_Header so
+                # vendors with no invoices are still searchable/selectable.
+                cur.execute("""
+                    SELECT VendorID, CompanyName
+                    FROM Vendors
+                """)
+                vendor_data = cur.fetchall()
 
             self.invoices = [row for row in data if row["VendorID"] and row["InvoiceNum"] and row["InvoiceDate"] 
                             and row["Subtotal"] is not None and row["Payments"] is not None]
@@ -256,7 +265,11 @@ class InvoiceViewer(tk.Tk):
                     seen_invoices.add(key)
             self.broken_companies = [row for row in data if not (row["VendorID"] and row["InvoiceNum"] and row["InvoiceDate"] 
                                      and row["Subtotal"] is not None and row["Payments"] is not None)]
-            self.company_ids = {(row["VendorID"], row["CompanyName"], row["VendorID"] in self.ignore_list) for row in self.invoices if row["VendorID"] and row["CompanyName"]}
+            self.company_ids = {
+                (str(row["VendorID"]), str(row.get("CompanyName") or ""), str(row["VendorID"]) in self.ignore_list)
+                for row in vendor_data
+                if row.get("VendorID")
+            }
             self.by_vendor_invoice = {(row["VendorID"], row["InvoiceNum"]): row for row in self.invoices}
 
             t1 = time.perf_counter()
@@ -608,6 +621,7 @@ class InvoiceViewer(tk.Tk):
         else:
             self.amount_label.config(text=f"{total:,} invoices found.")
 
+
     def update_selected_sum(self, *_):
         total = 0
         for item in self.tree.selection():
@@ -712,6 +726,7 @@ class InvoiceViewer(tk.Tk):
         self.balance_total.set(f"Balance Total: {balance_total_s}")
         return invoice_count, values
 
+
     def filter_rows(self, company, invoice_prefix, account_filter):
         company_l = company.lower()
         invoice_l = invoice_prefix.lower()
@@ -741,6 +756,7 @@ class InvoiceViewer(tk.Tk):
         self.load_more_rows(reset=True)
         return self.result_count
 
+
     def clear_filters(self):
         self.company_entry.delete(0, "end")
         self.invoice_entry.delete(0, "end")
@@ -768,6 +784,7 @@ class InvoiceViewer(tk.Tk):
                 total += float(amt.replace("$", "").replace("(", "-").replace(",", "").replace(")", ""))
         total_s = f"${total:,.2f}" if total >= 0 else f"(${abs(total):,.2f})"
         self.account_sum.set(f"Account Total: {total_s}")
+
 
     def _sync_sort_aliases(self):
         """Keep the original single-sort attributes in sync with the primary criterion."""
@@ -901,6 +918,7 @@ class InvoiceViewer(tk.Tk):
         self.config(cursor="")
         self.tree.config(cursor="")
         return "break"
+
 
     def account_match_filter(self, account_filter, account):
         filter = account_filter.lower()
@@ -1123,6 +1141,7 @@ class AutoCompleteEntry(tk.Entry):
         self.config(cursor="")
         self.root.tree.config(cursor="")
         self.close_listbox()
+
 
     def listbox_move(self, dir):
         if not self.listbox:
@@ -1370,6 +1389,7 @@ class AutoCompleteEntry(tk.Entry):
             self.tree.set(row, "GL Account", "▲" if new_open else "▼")
         self.tree.item(row, open=new_open)
 
+
     def toggle_gl_accounts(self, row):
         if self.tree.set(row, "GL Account") not in ("▼", "▲"):
             return
@@ -1380,6 +1400,7 @@ class AutoCompleteEntry(tk.Entry):
         if self.tree.set(row, "Check Number") in ("▲", "▼"):
             self.tree.set(row, "Check Number", "▲" if new_open else "▼")
         self.tree.item(row, open=new_open)
+
 
     def toggle_all_companies(self):
         if self.root.all_companies.get():
