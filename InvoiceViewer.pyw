@@ -45,6 +45,7 @@ class InvoiceViewer(tk.Tk):
         self.cd_by_check_id = {}
         self.check_record_ids_by_ap_record = defaultdict(list)
         self.check_ids_by_ap_record = defaultdict(list)
+        self.check_details_by_ap_record = defaultdict(list) # AP RecordNum -> [(CheckID, Check_Detail RecordID)]
         self.duplicate_invoices = []
 
         self.log_usage()
@@ -55,6 +56,10 @@ class InvoiceViewer(tk.Tk):
         with open("ignore.json", "r") as f:
             self.ignore_list = set(json.load(f))
         self.protocol("WM_DELETE_WINDOW", self.on_exit)  # runs exit protocol on window closed
+
+        # Any left-click in the window lets the autocomplete box close itself if the click was outside it.
+        # Bound once on the root window so it survives restarts.
+        self.bind("<Button-1>", self.on_window_click, add="+")
 
         # Loading info
         self.startup_sound()
@@ -142,12 +147,11 @@ class InvoiceViewer(tk.Tk):
         self.error_popup = ErrorPopup(self, self.broken_companies, self.broken_invoices, self.missing_invoices, self.duplicate_invoices)
         self.help_popup = HelpPopup(self)
 
-        # Ignore list image
+        # Ignore list image - lives in the right button frame, just left of the restart button
         self.ignore_photo = tk.PhotoImage(file="leaf.png")
-        self.ignore_label = tk.Label(self.filter_frame, image=self.ignore_photo)
-        self.bind("<Control-F9>", self.add_ignore)
-        self.bind("<Control-F10>", self.toggle_ignore_list)
-
+        self.ignore_label = ttk.Label(self.right_button_frame, image=self.ignore_photo)
+        if not self.ignoring:  # keep the leaf showing after a restart
+            self.show_ignore_leaf()
         self.bind("<Control-F9>", self.add_ignore)
         self.bind("<Control-F10>", self.toggle_ignore_list)
 
@@ -295,8 +299,12 @@ class InvoiceViewer(tk.Tk):
                 ap_rec = row.get("AP_Record")
                 rec_id = row.get("RecordID")
                 chk_id = row.get("CheckID")
-                
+
                 if ap_rec:
+                    # Keep each CheckID paired with its Check_Detail RecordID for the Record Info panel
+                    pair = (chk_id, rec_id)
+                    if (chk_id or rec_id) and pair not in self.check_details_by_ap_record[ap_rec]:
+                        self.check_details_by_ap_record[ap_rec].append(pair)
                     # Append RecordID
                     if rec_id and rec_id not in self.check_record_ids_by_ap_record[ap_rec]:
                         self.check_record_ids_by_ap_record[ap_rec].append(rec_id)
@@ -386,7 +394,7 @@ class InvoiceViewer(tk.Tk):
 
 
     def create_filter_frame(self):
-        self.filter_frame = ttk.Frame(self, height=60)
+        self.filter_frame = ttk.Frame(self, height=88)
         self.filter_frame.grid(row=0, column=0, sticky="ew")
         self.filter_frame.grid_propagate(False)
 
@@ -418,20 +426,28 @@ class InvoiceViewer(tk.Tk):
         self.end_entry.bind("<Return>", self.company_entry.on_select)
         self.end_entry.bind("<<DateEntrySelected>>", self.company_entry.on_select)
 
+        # Row 2 - the three checkboxes sit side by side, right-aligned so they end just left of the Record Info box
+        self.checkbox_frame = ttk.Frame(self.filter_frame)
+        self.checkbox_frame.grid(row=2, column=0, columnspan=8, padx=5, pady=(2, 0), sticky="e")
+
         # All companies checkbox
         self.all_companies = tk.BooleanVar()
-        self.all_companies_cb = ttk.Checkbutton(self.filter_frame, text="View All Companies", variable=self.all_companies, command=self.company_entry.toggle_all_companies, takefocus=False)
-        self.all_companies_cb.grid(row=0, column=8, padx=5)
+        self.all_companies_cb = ttk.Checkbutton(self.checkbox_frame, text="View All Companies", variable=self.all_companies, command=self.company_entry.toggle_all_companies, takefocus=False)
+        self.all_companies_cb.pack(side="left")
 
         # Search names checkbox - when on, the company box also matches vendor names, not just IDs
         self.search_names = tk.BooleanVar()
-        self.search_names_cb = ttk.Checkbutton(self.filter_frame, text="Search Names", variable=self.search_names, command=self.company_entry.on_select, takefocus=False)
-        self.search_names_cb.grid(row=1, column=8, padx=5, sticky="w")
+        self.search_names_cb = ttk.Checkbutton(self.checkbox_frame, text="Search Names", variable=self.search_names, command=self.company_entry.on_select, takefocus=False)
+        self.search_names_cb.pack(side="left", padx=(18, 0))
 
         # PDF Only Checkbox
         self.pdf_only = tk.BooleanVar()
-        self.pdf_cb = ttk.Checkbutton(self.filter_frame, text="File Available Only", variable=self.pdf_only, command=self.company_entry.on_select, takefocus=False)
-        self.pdf_cb.grid(row=0, column=9, padx=5)
+        self.pdf_cb = ttk.Checkbutton(self.checkbox_frame, text="File Available Only", variable=self.pdf_only, command=self.company_entry.on_select, takefocus=False)
+        self.pdf_cb.pack(side="left", padx=(18, 0))
+
+        # Record info panel - fills in when an invoice row is clicked
+        self.create_record_panel()
+        self.record_frame.grid(row=0, column=8, rowspan=3, padx=(10, 5), pady=(4, 4), sticky="nsw")
 
         # Far right frame for buttons
         self.filter_frame.columnconfigure(10, weight=1)
@@ -481,6 +497,144 @@ class InvoiceViewer(tk.Tk):
         # Clear Filters Button
         self.clear_button = tk.Button(self.filter_frame, text="Clear Filters", command=self.clear_filters)
         self.clear_button.grid(row=1, column=6, columnspan=2, padx=5, sticky="ew")
+
+
+    def create_record_panel(self):
+        # Fixed-size read-only box showing database references for the clicked (dark blue) row:
+        #   Record #: ...     AP Journal: ...
+        #   Check ID: ...     Detail ID: ...     CD Journal: ...     <- one line per check
+        # Columns are fixed tab stops so values always line up. Text is selectable (Ctrl+C), and
+        # right-click offers Copy / Copy All. A scrollbar appears only if there are more checks than fit.
+        family = font.nametofont("TkDefaultFont").actual("family")
+        self.record_font = font.Font(family=family, size=9)
+        f = self.record_font
+
+        # Fixed column positions, sized for typical values (e.g. 8-digit IDs, 10-character journal IDs)
+        gap = 18
+        col1 = max(f.measure("Record #: "), f.measure("Check ID: ")) + f.measure("00000000") + gap
+        col2 = col1 + f.measure("Detail ID: ") + f.measure("000000000") + gap
+        col3_width = max(f.measure("AP Journal: "), f.measure("CD Journal: ")) + f.measure("CD00000000") + 8
+        self.record_tabs = (col1, col2)
+        padx = 6
+        scrollbar_room = 18  # so a scrollbar (many checks) never covers the last column
+        width_chars = -(-(col2 + col3_width + 2 * padx + scrollbar_room) // max(1, f.measure("0")))  # round up
+
+        self.record_frame = tk.Frame(self.filter_frame, background="#a0a0a0")  # 1px border
+        inner = tk.Frame(self.record_frame, background="white")
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        self.record_text = tk.Text(inner, width=width_chars, height=4, wrap="none", font=f, tabs=self.record_tabs,
+                                   relief="flat", borderwidth=0, highlightthickness=0, padx=padx, pady=3,
+                                   background="white", cursor="arrow", takefocus=0)
+        self.record_scroll = ttk.Scrollbar(inner, orient="vertical", command=self.record_text.yview)
+        self.record_text.configure(yscrollcommand=self._record_scroll_set)
+        self.record_text.pack(side="left", fill="both", expand=True)
+
+        self.record_text.tag_configure("label", foreground="#6b6b6b")
+        self.record_text.tag_configure("value", foreground="#000000")
+        self.record_text.tag_configure("muted", foreground="#8a8a8a")
+        self.record_text.tag_raise("sel")
+
+        self.record_text.bind("<Button-1>", lambda e: self.record_text.focus_set(), add="+")
+        self.record_text.bind("<Button-3>", self.show_record_menu)
+
+        # Lock the box width so it never changes (height comes from the three filter rows)
+        self.record_frame.update_idletasks()
+        self.record_frame.configure(width=self.record_frame.winfo_reqwidth())
+        self.record_frame.pack_propagate(False)
+        self.update_record_info()
+
+
+    def _record_scroll_set(self, first, last):
+        # Only show the scrollbar when there are more checks than fit in the box
+        self.record_scroll.set(first, last)
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.record_scroll.pack_forget()
+        elif not self.record_scroll.winfo_ismapped():
+            self.record_scroll.pack(side="right", fill="y", before=self.record_text)
+
+
+    def update_record_info(self, *_):
+        # Fill the Record Info panel from the clicked (dark blue) row; subrows use their parent invoice
+        text = getattr(self, "record_text", None)
+        if text is None or not text.winfo_exists():
+            return
+
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+
+        def write_line(cells, first=False):
+            if not first:
+                text.insert("end", "\n")
+            for j, (label, value) in enumerate(cells):
+                if j:
+                    text.insert("end", "\t")
+                text.insert("end", label, "label")
+                text.insert("end", value, "value")
+
+        row = self.primary_row()
+        if not row:
+            text.insert("end", "Click a row to see its record info.", "muted")
+            text.configure(state="disabled")
+            return
+
+        target = self.tree.parent(row) or row
+        vendor = self.tree.set(target, "Vendor")
+        invoice = self.tree.set(target, "Invoice")
+        row_data = self.by_vendor_invoice.get((vendor, invoice)) if vendor and invoice else None
+        record_num = row_data.get("RecordNum") if row_data else None
+
+        if record_num is None:
+            text.insert("end", "No record info found for this invoice.", "muted")
+            text.configure(state="disabled")
+            return
+
+        def s(v):
+            return "—" if v is None or v == "" else str(v)
+
+        # Line 1: Record # and AP Journal (both left-aligned, in the first two columns)
+        write_line([("Record #: ", s(record_num)), ("AP Journal: ", s(self.ap_by_record_num.get(record_num)))], first=True)
+
+        # One line per check
+        pairs = self.check_details_by_ap_record.get(record_num, [])
+        for check_id, detail_id in pairs:
+            write_line([("Check ID: ", s(check_id)), ("Detail ID: ", s(detail_id)),
+                        ("CD Journal: ", s(self.cd_by_check_id.get(check_id)))])
+        if not pairs:
+            text.insert("end", "\nNo checks found for this invoice.", "muted")
+
+        # If an unusually long value would overrun its column, widen the tab stops for this invoice only
+        def widest(col):
+            widths = []
+            for line in text.get("1.0", "end-1c").split("\n"):
+                cells = line.split("\t")
+                if len(cells) > col:
+                    widths.append(self.record_font.measure(cells[col]))
+            return max(widths, default=0)
+        col1 = max(self.record_tabs[0], widest(0) + 18)
+        col2 = max(self.record_tabs[1], col1 + widest(1) + 18)
+        text.configure(tabs=(col1, col2))
+
+        text.configure(state="disabled")
+        text.yview_moveto(0)
+
+
+    def show_record_menu(self, event):
+        text = self.record_text
+        menu = tk.Menu(text, tearoff=0)
+        has_sel = bool(text.tag_ranges("sel"))
+        menu.add_command(label="Copy", state="normal" if has_sel else "disabled",
+                         command=lambda: self._copy_text(text.get("sel.first", "sel.last")))
+        menu.add_command(label="Copy All", command=lambda: self._copy_text(text.get("1.0", "end-1c")))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+
+    def _copy_text(self, value):
+        self.clipboard_clear()
+        self.clipboard_append(value)
 
 
     def create_summary_bar(self):
@@ -547,12 +701,49 @@ class InvoiceViewer(tk.Tk):
         self.tree_scrollbar.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=self._on_tree_scroll)
         self.tree.bind("<<TreeviewSelect>>", self.update_selected_sum)
+        self.tree.bind("<<TreeviewSelect>>", self.update_record_info, add="+")
+        self.tree.bind("<<TreeviewSelect>>", self.update_selection_colors, add="+")
         self.tree.bind("<Button-3>", self.on_sort_header_right_click)
 
         self.style.configure("Treeview", rowheight=20) 
         self.tree.tag_configure("oddrow",  background="#f7f7f7")
         self.tree.tag_configure("evenrow", background="#ffffff")
         self.tree.tag_configure("checkrow", background="#fdfaf1")
+
+        # Selection colors are drawn with tags instead of the theme, so the row the Record Info box
+        # is showing (the clicked row) can stay dark blue while other selected rows are lighter blue.
+        self.style.map("Treeview", background=[("disabled", "#dcdad5")], foreground=[("disabled", "#999999")])
+        self.tree.tag_configure("sel_primary",   background="#4a6984", foreground="#ffffff")
+        self.tree.tag_configure("sel_secondary", background="#a9c0d6", foreground="#000000")
+        self._highlighted = {}  # item -> its original tags, for rows currently drawn as selected
+
+
+    def primary_row(self):
+        # The row the user last clicked (tree focus) if it's selected, otherwise the first selected row
+        row = self.tree.focus()
+        selection = self.tree.selection()
+        if not row or not self.tree.exists(row) or row not in selection:
+            row = selection[0] if selection else ""
+        return row
+
+
+    def update_selection_colors(self, *_):
+        selection = set(self.tree.selection())
+        primary = self.primary_row()
+
+        # Restore rows that are no longer selected
+        for item in list(self._highlighted):
+            if item not in selection:
+                base = self._highlighted.pop(item)
+                if self.tree.exists(item):
+                    self.tree.item(item, tags=base)
+
+        # Paint selected rows: clicked row dark blue, the rest lighter blue
+        for item in selection:
+            if item not in self._highlighted:
+                self._highlighted[item] = tuple(t for t in self.tree.item(item, "tags") if not t.startswith("sel_"))
+            # Only the selection tag while selected, so the stripe color can't override it
+            self.tree.item(item, tags=("sel_primary" if item == primary else "sel_secondary",))
 
 
     def _on_tree_scroll(self, first, last):
@@ -599,6 +790,7 @@ class InvoiceViewer(tk.Tk):
             if reset:
                 self.tree.delete(*self.tree.get_children())
                 self.displayed_count = 0
+                self._highlighted.clear()
 
             start = self.displayed_count
             end = min(start + self.page_size, len(self.current_rows))
@@ -608,6 +800,8 @@ class InvoiceViewer(tk.Tk):
         finally:
             self._loading_page = False
         self.update_result_label()
+        if reset:
+            self.update_record_info()  # rows were replaced, so clear the Record Info panel
 
 
     def update_result_label(self):
@@ -979,6 +1173,7 @@ class InvoiceViewer(tk.Tk):
         self.cd_by_check_id = {}
         self.check_record_ids_by_ap_record.clear()
         self.check_ids_by_ap_record.clear()
+        self.check_details_by_ap_record.clear()
         self.duplicate_invoices.clear()
 
         self.columnconfigure(0, weight=0)
@@ -1000,11 +1195,25 @@ class InvoiceViewer(tk.Tk):
     def toggle_ignore_list(self, event):
         self.ignoring = not self.ignoring
         if self.ignoring:
-            self.ignore_label.grid_forget()
+            self.ignore_label.pack_forget()
         else:
-            self.ignore_label.grid(row=0, column=12, sticky="w", padx=39)
+            self.show_ignore_leaf()
         self.company_entry.on_select()
         return "break"
+
+
+    def show_ignore_leaf(self):
+        # Always sits immediately to the left of the restart (⭮) button
+        self.ignore_label.pack(side="left", padx=(0, 6), before=self.refresh_button)
+
+
+    def on_window_click(self, event):
+        entry = getattr(self, "company_entry", None)
+        try:
+            if entry is not None and entry.winfo_exists():
+                entry.on_window_click(event)
+        except tk.TclError:
+            pass
 
 
     def add_ignore(self, event):
@@ -1028,17 +1237,19 @@ class AutoCompleteEntry(tk.Entry):
         self.company_ids = root.company_ids
         self.tree = root.tree
         self.root = root
-        self.listbox = None
+        self.listbox = None  # Treeview inside the suggestion popup (None when closed)
+        self.popup = None    # Frame holding the listbox, scrollbar and border
         self.company = tk.StringVar()
         self.prev_company = ""
-        self["textvariable"] = self.company 
-        self.search_job = None 
+        self["textvariable"] = self.company
+        self.search_job = None
 
         self.text_trace = self.company.trace_add("write", self.show_suggestions)
         self.bind("<Return>", self.on_select)
         self.bind("<Up>", lambda *_: self.listbox_move("up"))
         self.bind("<Down>", lambda *_: self.listbox_move("down"))
         self.bind("<Escape>", self.close_listbox)
+        self.bind("<Button-1>", self.on_entry_click, add="+")
         self.tree.bind("<ButtonPress-1>", self.on_row_click, True)
         self.tree.bind("<Button-3>", self.show_cell_menu, True)
         #self.tree.bind("<Double-1>", self.open_file)
@@ -1051,32 +1262,86 @@ class AutoCompleteEntry(tk.Entry):
             self.close_listbox()
             return
 
+        text_l = text.lower()
+        search_names = self.root.search_names.get()
         matches = [w for w in self.company_ids
-                   if (w[0].lower().startswith(text.lower())
-                       or (self.root.search_names.get() and text.lower() in w[1].lower()))
+                   if (w[0].lower().startswith(text_l)
+                       or (search_names and text_l in w[1].lower()))
                    and (not self.root.ignoring or not w[2])]
         if not matches:
             self.close_listbox()
             return
 
         if self.listbox is None:
-            self.listbox = ttk.Treeview(self.root, columns=("id", "name"), show="tree", height=8)
-            self.listbox.heading("id", text="ID")
-            self.listbox.heading("name", text="Name")
-            self.listbox.bind("<ButtonRelease-1>", self.on_select)
-            self.listbox.bind("<Return>", self.on_select)
-            self.listbox.bind("<Up>", lambda e: self.listbox_move("up"))
-            self.listbox.bind("<Down>", lambda e: self.listbox_move("down"))
+            self.build_listbox()
 
         self.listbox.delete(*self.listbox.get_children())
         matches.sort()  # Sort matches alphabetically
-        for w in matches:
-            self.listbox.insert("", tk.END, values=(w[0], w[1]))
+        for i, w in enumerate(matches):
+            self.listbox.insert("", tk.END, values=(w[0], w[1]), tags=("even" if i % 2 == 0 else "odd",))
+        self.listbox.configure(height=min(8, len(matches)))
 
-        # position the listbox just under the entry widget
-        x = self.winfo_x()
-        y = self.winfo_y() + self.winfo_height() + 7
-        self.listbox.place(x=x, y=y)
+        # position the popup just under the entry widget
+        x = self.winfo_rootx() - self.root.winfo_rootx()
+        y = self.winfo_rooty() - self.root.winfo_rooty() + self.winfo_height() + 2
+        self.popup.place(x=x, y=y)
+        self.popup.lift()
+
+
+    def build_listbox(self):
+        # Popup = 1px grey border > [ID | Name list] + vertical scrollbar
+        style = ttk.Style(self.root)
+        style.configure("Suggest.Treeview", rowheight=20)
+        style.map("Suggest.Treeview", background=[("selected", "#4a6984")], foreground=[("selected", "#ffffff")])
+
+        self.popup = tk.Frame(self.root, background="#7a7a7a")
+        inner = tk.Frame(self.popup, background="white")
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # show="" hides the empty tree column (the old left-side gap) and the headings
+        self.listbox = ttk.Treeview(inner, columns=("id", "name"), show="", height=8, selectmode="browse", style="Suggest.Treeview")
+        scrollbar = ttk.Scrollbar(inner, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.pack(side="left", fill="both", expand=True)
+
+        # Size columns once from all IDs/names so the box doesn't change width while typing
+        f = font.nametofont("TkDefaultFont")
+        longest = lambda idx: sorted({w[idx] for w in self.company_ids}, key=len, reverse=True)[:30]
+        id_width = max([f.measure(s) for s in longest(0)] + [f.measure("WWWWW")]) + 16
+        name_width = max([f.measure(s) for s in longest(1)] + [0]) + 16
+        name_width = max(240, min(name_width, 420))
+        self.listbox.column("id", width=id_width, minwidth=id_width, stretch=False, anchor="w")
+        self.listbox.column("name", width=name_width, minwidth=100, stretch=True, anchor="w")
+
+        # Thin divider line between the ID and Name columns
+        tk.Frame(self.listbox, background="#b5b5b5", width=1).place(x=id_width, y=0, width=1, relheight=1)
+
+        self.listbox.tag_configure("even", background="#ffffff")
+        self.listbox.tag_configure("odd", background="#f2f5f9")
+
+        self.listbox.bind("<ButtonRelease-1>", self.on_select)
+        self.listbox.bind("<Return>", self.on_select)
+        self.listbox.bind("<Up>", lambda e: self.listbox_move("up"))
+        self.listbox.bind("<Down>", lambda e: self.listbox_move("down"))
+        self.listbox.bind("<Escape>", self.close_listbox)
+
+
+    def on_entry_click(self, *_):
+        # Clicking back into the box reopens the suggestions if there are matches
+        if self.listbox is None and not self.root.all_companies.get():
+            self.after_idle(self.show_suggestions)
+
+
+    def on_window_click(self, event):
+        # Close the suggestions when the click lands anywhere other than the entry or the popup
+        if self.popup is None:
+            return
+        clicked = str(event.widget)
+        popup = str(self.popup)
+        if clicked == str(self) or clicked == popup or clicked.startswith(popup + "."):
+            return
+        self.close_listbox()
 
 
     def on_select(self, *_, source=None):
@@ -1162,6 +1427,8 @@ class AutoCompleteEntry(tk.Entry):
 
 
     def on_row_click(self, event):
+        # Some clicks below return "break", which stops the window-wide handler, so close here too
+        self.close_listbox()
         if self.tree.identify_region(event.x, event.y) != "cell":
             return
     
@@ -1225,49 +1492,7 @@ class AutoCompleteEntry(tk.Entry):
             menu.add_command(label=f"Copy {heading} ({n} rows)", command=lambda: self.copy_column(rows, col_name))
             menu.add_command(label=f"Copy Rows ({n} rows)", command=lambda: self.copy_rows(rows))
         else:
-            # Show Invoice Record Number
-            parent_id = self.tree.parent(row)
-            target_row = parent_id if parent_id else row
-            
-            vendor = self.tree.set(target_row, "Vendor")
-            invoice = self.tree.set(target_row, "Invoice")
-            
-            if vendor and invoice:
-                # Fetch full row data from the dictionary built during load
-                row_data = self.root.by_vendor_invoice.get((vendor, invoice))
-                if row_data:
-                    company_name = str(row_data.get("CompanyName", "")).strip()
-
-                    if "RecordNum" in row_data:
-                        record_num = row_data["RecordNum"]
-                        
-                        # 1. Record Number
-                        menu.add_command(label=f"Record Number: {record_num}", state="disabled")
-
-                        # 2. Check Detail Record IDs
-                        check_rec_ids = self.root.check_record_ids_by_ap_record.get(record_num, [])
-                        for check_rec_id in check_rec_ids:
-                            menu.add_command(label=f"Check Detail ID: {check_rec_id}", state="disabled")
-
-                        # 3. Check IDs (Mapped via CheckID)
-                        check_ids = self.root.check_ids_by_ap_record.get(record_num, [])
-                        for check_id in check_ids:
-                            menu.add_command(label=f"Check ID: {check_id}", state="disabled")
-
-                        # 4. AP Number (Mapped via RecordNum)
-                        ap_num = self.root.ap_by_record_num.get(record_num)
-                        if ap_num:
-                            menu.add_command(label=f"Journal ID: {ap_num}", state="disabled")
-
-                        # 5. CD Number (Mapped via CheckID)
-                        for check_id in check_ids:
-                            cd_num = self.root.cd_by_check_id.get(check_id)
-                            if cd_num:
-                                menu.add_command(label=f"Journal ID: {cd_num}", state="disabled")
-                            
-                        # Add separator after informational headers
-                        menu.add_separator()
-
+            # Record info (Record #, Check/Detail IDs, Journal IDs) now shows in the Record Info panel
             value = self.tree.set(row, col_name)
             # Disable the cell copy if there's nothing meaningful to copy (blank / arrows / checkmark)
             if value and value not in ("▼", "▲", "✔"):
@@ -1420,9 +1645,13 @@ class AutoCompleteEntry(tk.Entry):
 
 
     def close_listbox(self, *_):
-        if self.listbox:
-            self.listbox.destroy()
-            self.listbox = None
+        if self.popup is not None:
+            try:
+                self.popup.destroy()
+            except tk.TclError:
+                pass
+        self.popup = None
+        self.listbox = None
 
     
     def open_file(self, event):
@@ -1560,7 +1789,8 @@ class HelpPopup(tk.Toplevel):
 
         h("SEARCHING FOR INVOICES")
         b("Company ID  — Type a vendor ID into the Company ID box. A suggestion list will")
-        b("appear; click a result or press Enter to load that vendor's invoices")
+        b("appear; click a result or press Enter to load that vendor's invoices. Clicking")
+        b("anywhere else closes the list; click back into the Company ID box to reopen it")
         b("")
         b("View All Companies  — Check this box to show invoices across all vendors at once")
         b("In this mode the Company ID box becomes a prefix filter: typing 'AC' shows every")
@@ -1622,11 +1852,22 @@ class HelpPopup(tk.Toplevel):
         b("Double left-click any row that has a ✔ in the File Available column to open the")
         b("invoice PDF")
 
-        h("DATABASE REFERENCES AND COPYING DATA")
+        h("DATABASE REFERENCES (RECORD INFO PANEL)")
+        b("Click any row and the Record Info box at the top of the window fills in with that")
+        b("invoice's database references. The row the box is showing is always the dark blue")
+        b("one; any other selected rows are a lighter blue:")
+        i("Record #    — Use to find the invoice in the AP_Header table")
+        i("AP Journal  — The invoice's journal ID in GL_Journal_Detail_Source")
+        b("Then one line for each check that paid the invoice:")
+        i("Check ID    — Use in Check_Header / Check_Detail")
+        i("Detail ID   — The Check_Detail RecordID for that check")
+        i("CD Journal  — The check's journal ID in GL_Journal_Detail_Source")
+        b("If there are more checks than fit, a scrollbar appears in the box. The info stays")
+        b("put until you click another row. Highlight any value and press Ctrl+C to copy it,")
+        b("or right-click the box for Copy / Copy All (Copy All pastes neatly into Excel)")
+
+        h("COPYING DATA")
         b("Right-click any cell to open a small menu")
-        i("The top of the menu shows the invoice's Record Number, Check Record ID, Check ID, AP Journal ID, and CD Journal ID(s) if available")
-        i("The Record Number can be used to find invoices in the AP_Header table, and the Journal IDs can be used for the AP_Journal_Detail_Source table")
-        i("The Check Detail ID can be used to find invoices in the Check_Detail table, while the Check ID can also be used for the Check_Header table")
         i("Copy <Column>   — Copies just that cell, e.g. an invoice number or GL account")
         i("Copy Row — Copies the whole row, tab-separated (pastes neatly into Excel)")
         i("Copy Date & Invoice — Copies the date and invoice number for one row, underscore-separated")
@@ -1647,7 +1888,9 @@ class HelpPopup(tk.Toplevel):
         b("The primary sort shows ▲ or ▼; secondary sorts show the same arrow plus 2, 3, etc.")
 
         h("SELECTING ROWS AND TOTALS")
-        b("Click a row to select it. The totals bar at the bottom of the window shows:")
+        b("Click a row to select it. The row you clicked last is dark blue (it's the one shown")
+        b("in the Record Info box); other selected rows are a lighter blue")
+        b("The totals bar at the bottom of the window shows:")
         i("Account Total  — Sum of GL distribution amounts for all visible invoices")
         i("Selected Total — Sum of Invoice Amount for only the rows you have selected")
         i("Invoice Total  — Sum of Invoice Amount for all visible invoices")
